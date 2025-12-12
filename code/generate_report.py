@@ -11,7 +11,7 @@ import config
 import os
 
 # ==========================================
-# 1. MODEL DEFINITION (Must Match Training)
+# 1. MODEL DEFINITION
 # ==========================================
 class HybridGemmaClassifier(nn.Module):
     def __init__(self, input_dim):
@@ -69,7 +69,7 @@ class HybridGemmaClassifier(nn.Module):
         return self.classifier(last_hidden)
 
 # ==========================================
-# 2. DATALOADER (Same as Training)
+# 2. DATALOADER
 # ==========================================
 def create_dataloader(df, embeddings, labels=None, tokenizer=None, batch_size=32):
     # NOTE: If you used Romanization in training, add the function call here!
