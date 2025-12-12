@@ -38,6 +38,7 @@ Fed both the Romanized Text and the Fused Vector into Gemma.
 | Loss           | CrossEntropy + Label Smoothing (0.1) |
 
 ### 🏆 Performance Strategy
+
 #### Why Romanization?
 Benchmarks showed that Gemma-3 performed 15-20% worse on raw Indic scripts compared to Romanized text. By transliterating, the model's English-centric pre-training was leveraged.
 
