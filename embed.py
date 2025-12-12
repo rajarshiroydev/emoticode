@@ -1,87 +1,93 @@
+# embed_fusion.py
 import torch
 import pandas as pd
 import os
 import gc
 from transformers import AutoTokenizer, AutoModel
+from sentence_transformers import SentenceTransformer
 import config
 
-# Use NLLB-200 Distilled (Fast, High Performance, 1024-dim)
-MODEL_NAME = "facebook/nllb-200-distilled-600M"
-
-def get_nllb_embeddings():
-    print("=== STEP 1: NLLB Embedding Generation ===")
+def get_fused_embeddings():
+    print("=== STEP 1: Feature Fusion (NLLB + LaBSE) ===")
     
-    print(f"Loading {MODEL_NAME}...")
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-    model = AutoModel.from_pretrained(MODEL_NAME).to(config.DEVICE)
-    model.eval()
+    # --- MODEL 1: NLLB (1024 dim) ---
+    print("1. Generatng NLLB Embeddings...")
+    nllb_model_name = "facebook/nllb-200-distilled-600M"
+    nllb_tokenizer = AutoTokenizer.from_pretrained(nllb_model_name)
+    nllb_model = AutoModel.from_pretrained(nllb_model_name).to(config.DEVICE)
+    nllb_model.eval()
+
+    # --- MODEL 2: LaBSE (768 dim) ---
+    print("2. Generating LaBSE Embeddings...")
+    labse_model = SentenceTransformer("sentence-transformers/LaBSE", device=config.DEVICE)
 
     def generate(csv_path, out_path, filter_langs=True):
         if not os.path.exists(csv_path): return
-        print(f"Processing {csv_path}...")
+        print(f"   Processing {csv_path}...")
         
         df = pd.read_csv(csv_path)
-        
-        # Filter Languages
         if filter_langs:
             df = df[df['language'].isin(config.LANG_MAP.keys())]
         
-        # Map to NLLB codes (Same as SONAR codes!)
+        # IMPORTANT: Reset index to ensure alignment
+        df.reset_index(drop=True, inplace=True)
+        sentences = df['Sentence'].tolist()
         df['lang_code'] = df['language'].map(config.LANG_MAP)
+
+        # --- PART A: Get LaBSE Vectors (Bulk) ---
+        print("     -> Encoding LaBSE...")
+        labse_emb = labse_model.encode(sentences, batch_size=64, convert_to_tensor=True, show_progress_bar=True)
+        # Ensure it's on CPU
+        labse_emb = labse_emb.cpu()
+
+        # --- PART B: Get NLLB Vectors (By Language) ---
+        print("     -> Encoding NLLB...")
+        nllb_emb_list = [None] * len(df)
         
-        all_embeddings = [None] * len(df)
-        
-        # Process by Language Group
         for lang_code, group in df.groupby('lang_code'):
             if pd.isna(lang_code): continue
             
-            sentences = group['Sentence'].tolist()
-            indices = group.index.tolist()
+            grp_sentences = group['Sentence'].tolist()
+            grp_indices = group.index.tolist()
             
-            # NLLB requires setting the source language
-            tokenizer.src_lang = lang_code
+            nllb_tokenizer.src_lang = lang_code
             
-            # Batching to save memory
             BATCH_SIZE = 32
-            for i in range(0, len(sentences), BATCH_SIZE):
-                batch_text = sentences[i : i+BATCH_SIZE]
-                batch_idx = indices[i : i+BATCH_SIZE]
+            for i in range(0, len(grp_sentences), BATCH_SIZE):
+                batch_text = grp_sentences[i : i+BATCH_SIZE]
+                batch_idx = grp_indices[i : i+BATCH_SIZE]
                 
-                inputs = tokenizer(batch_text, return_tensors="pt", padding=True, truncation=True, max_length=128).to(config.DEVICE)
+                inputs = nllb_tokenizer(batch_text, padding=True, truncation=True, max_length=128, return_tensors="pt").to(config.DEVICE)
                 
                 with torch.no_grad():
-                    # Encoder-only inference
-                    outputs = model.encoder(**inputs)
-                    
-                    # Mean Pooling (Attention-masked)
+                    outputs = nllb_model.encoder(**inputs)
+                    # Mean Pooling
                     mask = inputs.attention_mask.unsqueeze(-1).expand(outputs.last_hidden_state.size()).float()
-                    sum_embeddings = torch.sum(outputs.last_hidden_state * mask, 1)
+                    sum_emb = torch.sum(outputs.last_hidden_state * mask, 1)
                     sum_mask = torch.clamp(mask.sum(1), min=1e-9)
-                    mean_embeddings = sum_embeddings / sum_mask
-                    
-                    # Normalize (Improves Classification)
-                    mean_embeddings = torch.nn.functional.normalize(mean_embeddings, p=2, dim=1)
-                    
-                    # Move to CPU
-                    mean_embeddings = mean_embeddings.cpu()
+                    mean_emb = sum_emb / sum_mask
+                    mean_emb = torch.nn.functional.normalize(mean_emb, p=2, dim=1)
                 
-                # Store results
-                for k, result_idx in enumerate(batch_idx):
-                    all_embeddings[result_idx] = mean_embeddings[k]
-
-        # Clean up list
-        final_list = [e for e in all_embeddings if e is not None]
-        final_tensor = torch.stack(final_list)
+                for k, idx in enumerate(batch_idx):
+                    nllb_emb_list[idx] = mean_emb[k].cpu()
         
-        torch.save(final_tensor, out_path)
-        print(f"Saved {out_path} (Shape: {final_tensor.shape})")
+        # Handle case where NLLB might miss rows (unlikely but safe)
+        nllb_tensor_list = [e if e is not None else torch.zeros(1024) for e in nllb_emb_list]
+        nllb_tensor = torch.stack(nllb_tensor_list)
 
-    # Run
+        # --- PART C: FUSION ---
+        print("     -> Fusing Vectors...")
+        # Concatenate: [Batch, 1024] + [Batch, 768] = [Batch, 1792]
+        fused_tensor = torch.cat([nllb_tensor, labse_emb], dim=1)
+        
+        torch.save(fused_tensor, out_path)
+        print(f"     -> Saved {out_path} (Shape: {fused_tensor.shape})")
+
     generate(config.TRAIN_CSV, config.TRAIN_EMBEDS, True)
     generate(config.VAL_CSV, config.VAL_EMBEDS, True)
     generate(config.TEST_CSV, config.TEST_EMBEDS, False)
     
-    print("✅ Done! Now run train.py")
+    print("✅ Fusion Complete. Run train_mixup.py")
 
 if __name__ == "__main__":
-    get_nllb_embeddings()
+    get_fused_embeddings()
